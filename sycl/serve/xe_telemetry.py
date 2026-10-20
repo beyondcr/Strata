@@ -54,14 +54,22 @@ class _XeGpu:
         except (OSError, TypeError):
             return "Intel Arc GPU"
 
-    def _stat(self):
-        """The sampler's entry for THIS card, or None.  A host can hold several Intel cards and the
-        sampler writes one entry per card, keyed by PCI address, so the entry is looked up rather than
-        taking whatever fields are present: the flat fields describe the first card, and reading those
-        on the second card reports the other card's capacity and usage as its own."""
+    def _stat_paths(self):
+        """Where a sampler may have written.  /run belongs to the system unit, which runs as root and
+        sees every user's processes; the session runtime directory belongs to a user unit, which needs
+        no privilege and sees this user's.  The system one is tried first because it sees more."""
+        paths = [self.STAT]
+        rt = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        user = os.path.join(rt, "gpustat.json")
+        if user not in paths:
+            paths.append(user)
+        return paths
+
+    def _stat_from(self, path):
+        """The sampler's entry in one file for THIS card, or None."""
         try:
             import json
-            with open(self.STAT) as f:
+            with open(path) as f:
                 st = json.load(f)
             if time.time() - float(st.get("ts", 0)) >= 15:
                 return None
@@ -73,6 +81,17 @@ class _XeGpu:
             return st if (pci and st.get("pci") in (None, pci)) else None
         except (OSError, ValueError, AttributeError):
             return None
+
+    def _stat(self):
+        """The sampler's entry for THIS card, or None.  A host can hold several Intel cards and the
+        sampler writes one entry per card, keyed by PCI address, so the entry is looked up rather than
+        taking whatever fields are present: the flat fields describe the first card, and reading those
+        on the second card reports the other card's capacity and usage as its own."""
+        for path in self._stat_paths():
+            st = self._stat_from(path)
+            if st:
+                return st
+        return None
 
     def _rd(self, p):
         try:

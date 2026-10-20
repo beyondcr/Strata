@@ -9,20 +9,45 @@ Writes /run/gpustat.json every INTERVAL s; Strata's web app (serve/telemetry.py)
   trained at (the first upstream port wider than x1 - the card's own functions sit behind an internal
   x1 switch), the hottest VRAM channel, and the host's 1-minute load. Device totals only.
 Without it the Monitor tab still shows temperature, power and the PCIe link (sysfs), but not load or VRAM: xe
-reports those per client in /proc/*/fdinfo, which only root can read.
-Install:  sudo install -m 755 sycl/tools/gpustat.py /usr/local/sbin/
+reports those per client in /proc/*/fdinfo, which only the owning user or root can read.
+
+Install for one user (no privilege).  This covers every process that user runs, which is everything on a
+single-user workstation.  The sampler writes to the session's runtime directory, which the server also reads.
+          install -m 755 sycl/tools/gpustat.py ~/.local/bin/
+          install -m 644 sycl/tools/gpustat.user.service ~/.config/systemd/user/gpustat.service
+          systemctl --user enable --now gpustat
+
+Install system-wide (root).  Needed when the engine runs as a different user than the one who installed it,
+because another user's /proc/<pid>/fdinfo is not readable without CAP_SYS_PTRACE.  The sampler writes to
+/run/gpustat.json.
+          sudo install -m 755 sycl/tools/gpustat.py /usr/local/sbin/
           sudo install -m 644 sycl/tools/gpustat.service /etc/systemd/system/ && sudo systemctl enable --now gpustat
+
 Env: GPUSTAT_INTERVAL (s), GPUSTAT_POWER_WINDOW (s), GPUSTAT_PCI (sample only this card, e.g. 0000:03:00.0;
 default every Intel GPU on xe), GPUSTAT_VRAM_MB (the total; default the card's largest PCI BAR, which maps
 all of VRAM with resizable BAR - a little above what the runtime reports as usable; when more than one card
-is sampled it applies to each of them), GPUSTAT_OUT (the JSON path; default /run/gpustat.json).
+is sampled it applies to each of them), GPUSTAT_OUT (the JSON path; default /run/gpustat.json when /run is
+writable, otherwise the session's runtime directory).
 
 Every Intel xe card is sampled. The document holds one entry per card under "cards", keyed by PCI address,
 and the first card's fields are also written at the top level so a reader written before this still works.
 """
 import collections, glob, json, os, shlex, subprocess, time
 
-OUT = os.environ.get("GPUSTAT_OUT") or "/run/gpustat.json"
+
+def default_out():
+    """Where the sampler writes when GPUSTAT_OUT is not set.  /run serves the system unit, which runs
+    as root and is what a host shared between users needs; the session's runtime directory serves a
+    user unit, which needs no privilege and covers everything that user runs."""
+    if os.access("/run", os.W_OK):
+        return "/run/gpustat.json"
+    rt = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if os.path.isdir(rt):
+        return os.path.join(rt, "gpustat.json")
+    return "/run/gpustat.json"          # neither is available; the error names this path
+
+
+OUT = os.environ.get("GPUSTAT_OUT") or default_out()
 INTERVAL = float(os.environ.get("GPUSTAT_INTERVAL", "3"))   # each sample scans /proc/*/fd; keep it modest
 POWER_WINDOW = float(os.environ.get("GPUSTAT_POWER_WINDOW", "15"))
 NAMES = {"e223": "Intel(R) Arc(TM) Pro B70 Graphics"}

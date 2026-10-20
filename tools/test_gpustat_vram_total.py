@@ -261,9 +261,15 @@ class ReaderMatchingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         self.tmp.close()
+        # keep the real session directory out of these checks
+        self.rt = tempfile.mkdtemp()
+        self.env = patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.rt})
+        self.env.start()
 
     def tearDown(self):
+        self.env.stop()
         os.unlink(self.tmp.name)
+        os.rmdir(self.rt)
 
     def _reader(self, pci):
         g = telemetry._XeGpu.__new__(telemetry._XeGpu)     # no probing of this machine
@@ -317,6 +323,80 @@ class ReaderMatchingTests(unittest.TestCase):
         out = self._reader("0000:11:00.0").read()
         self.assertEqual(out["mem_total"], 16384 * 2**20)
         self.assertEqual(out["mem_used"], 200 * 2**20)
+
+
+class OutputPathTests(unittest.TestCase):
+    """default_out() must pick a place the sampler can actually write.
+
+    A system unit runs as root and writes /run; a user unit has no privilege, so it writes the
+    session runtime directory instead.
+    """
+
+    def test_run_is_used_when_it_is_writable(self):
+        with patch.object(gpustat.os, "access", lambda p, m: True):
+            self.assertEqual(gpustat.default_out(), "/run/gpustat.json")
+
+    def test_the_runtime_directory_is_used_when_run_is_not_writable(self):
+        with patch.object(gpustat.os, "access", lambda p, m: False), \
+             patch.object(gpustat.os.path, "isdir", lambda p: True), \
+             patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/4242"}):
+            self.assertEqual(gpustat.default_out(), "/run/user/4242/gpustat.json")
+
+    def test_the_uid_is_used_when_the_variable_is_unset(self):
+        env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+        with patch.object(gpustat.os, "access", lambda p, m: False), \
+             patch.object(gpustat.os.path, "isdir", lambda p: True), \
+             patch.dict(os.environ, env, clear=True), \
+             patch.object(gpustat.os, "getuid", lambda: 1000):
+            self.assertEqual(gpustat.default_out(), "/run/user/1000/gpustat.json")
+
+
+class BothPathsTests(unittest.TestCase):
+    """The reader must find a sampler at either location, and prefer the system one."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.system = os.path.join(self.dir, "system.json")
+        self.user = os.path.join(self.dir, "gpustat.json")
+        self.env = patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.dir})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        for p in (self.system, self.user):
+            if os.path.exists(p):
+                os.unlink(p)
+        os.rmdir(self.dir)
+
+    def _reader(self, pci="0000:0d:00.0"):
+        g = telemetry._XeGpu.__new__(telemetry._XeGpu)
+        g.dev = f"/sys/bus/pci/devices/{pci}"
+        g.hwmon = None
+        g._e = None
+        g.STAT = self.system
+        return g
+
+    def _write(self, path, total, pci="0000:0d:00.0"):
+        with open(path, "w") as f:
+            json.dump({"ts": time.time(), "cards": {pci: {"pci": pci, "vram_total_mb": total}}}, f)
+
+    def test_the_user_path_is_read_when_the_system_path_is_absent(self):
+        self._write(self.user, 32768)
+        self.assertEqual(self._reader()._stat()["vram_total_mb"], 32768)
+
+    def test_the_system_path_wins_when_both_are_present(self):
+        self._write(self.system, 11111)
+        self._write(self.user, 22222)
+        self.assertEqual(self._reader()._stat()["vram_total_mb"], 11111)
+
+    def test_the_user_path_is_used_when_the_system_path_is_stale(self):
+        with open(self.system, "w") as f:
+            json.dump({"ts": time.time() - 120, "cards": {"0000:0d:00.0": {"pci": "0000:0d:00.0", "vram_total_mb": 11111}}}, f)
+        self._write(self.user, 32768)
+        self.assertEqual(self._reader()._stat()["vram_total_mb"], 32768)
+
+    def test_both_missing_yields_nothing(self):
+        self.assertIsNone(self._reader()._stat())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+[Unit]
+Description=Intel Arc telemetry sampler -> the session runtime directory (Strata's Monitor tab: GPU load and VRAM)
+
+[Service]
+ExecStart=/usr/bin/python3 -u %h/.local/bin/gpustat.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
